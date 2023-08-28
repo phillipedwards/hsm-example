@@ -1,0 +1,3 @@
+name: hsm-example
+runtime: nodejs
+description: A minimal AWS TypeScript Pulumi program
