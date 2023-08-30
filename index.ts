@@ -2,8 +2,9 @@ import * as pulumi from "@pulumi/pulumi";
 import * as aws from "@pulumi/aws";
 import * as awsx from "@pulumi/awsx";
 import * as tls from "@pulumi/tls";
-import { CloudHSMV2 } from "@aws-sdk/client-cloudhsm-v2";
+import { CloudHSMV2, Cluster } from "@aws-sdk/client-cloudhsm-v2";
 import { fromIni } from "@aws-sdk/credential-provider-ini";
+import { Target } from "@pulumi/aws/appautoscaling";
 
 export = async () => {
     const config = new pulumi.Config("aws");
@@ -19,41 +20,9 @@ export = async () => {
         subnetIds: vpc.publicSubnetIds,
     });
 
-    // Get the id for the latest Amazon Linux AMI
-    const ami = await aws.ec2.getAmi({
-        filters: [
-            { name: "name", values: ["amzn-ami-hvm-*-x86_64-ebs"] },
-        ],
-        owners: ["137112412989"], // Amazon
-        mostRecent: true,
-    });
-
-    // create a new security group for port 80
-    const group = new aws.ec2.SecurityGroup("web-secgrp", {
-        ingress: [
-            { protocol: "tcp", fromPort: 22, toPort: 22, cidrBlocks: ["0.0.0.0/0"] },
-        ],
-    });
-
     const privateKey = new tls.PrivateKey("pk", {
         algorithm: "RSA",
         rsaBits: 2048
-    });
-
-    const key = new aws.ec2.KeyPair("kp", {
-        publicKey: privateKey.publicKeyOpenssh,
-    });
-
-    const instance = new aws.ec2.Instance("cluster-instance", {
-        instanceType: aws.ec2.InstanceType.T2_Micro, // t2.micro is available in the AWS free tier
-        vpcSecurityGroupIds: [ 
-            group.id,
-            cluster.securityGroupId, // gain access to the cluster instances
-        ], 
-        associatePublicIpAddress: true,
-        ami: ami.id,
-        keyName: key.keyName,
-        subnetId: vpc.subnets.apply(subs => subs[0].id),
     });
 
     const hsm = new aws.cloudhsmv2.Hsm("hsm1", {
@@ -61,60 +30,109 @@ export = async () => {
         subnetId: vpc.publicSubnetIds.apply(subs => subs[0]),
     });
 
-    // const hsm2 = new aws.cloudhsmv2.Hsm("hsm2", {
-    //     clusterId: cluster.id,
-    //     subnetId: vpc.publicSubnetIds.apply(subs => subs[0])
-    // });
-
     const cloudhsm = new CloudHSMV2({
         region: region,
         credentials: fromIni({ profile: profile })
     });
 
-    const clusterStatus = await getHsmClusterStatus(cloudhsm, cluster.id, "INITIALIZED");
+    const uninitializedCluster = await getHsmClusterStatus(cloudhsm, cluster.id, ["UNINITIALIZED"]);
+    const hsmPrivateKey = new tls.PrivateKey("cluster-pk", {
+        algorithm: "RSA",
+        rsaBits: 2048
+    });
+
+    const validHours = 24 * 365 * 10; // 10 years
+    const hsmSelfSignedCert = new tls.SelfSignedCert("cluster-selfsigned", {
+        privateKeyPem: privateKey.privateKeyPem,
+        isCaCertificate: true,
+        subject: {
+            country: "US",
+            postalCode: "CA",
+            organization: "Pulumi Cert Testing LTD"
+        },
+        allowedUses: [
+            "digital_signature",
+            "cert_signing",
+            "crl_signing",
+        ],
+        validityPeriodHours: validHours
+    });
+
+    const clusterCsr = uninitializedCluster?.cluster.Certificates?.apply(c => {
+        console.log(c!.ClusterCsr!);
+        return c!.ClusterCsr!;
+    }) ?? "";
+
+    const hsmSignedCert = new tls.LocallySignedCert("cluster-cert", {
+        certRequestPem: clusterCsr,
+        caPrivateKeyPem: hsmPrivateKey.privateKeyPem,
+        caCertPem: hsmSelfSignedCert.certPem,
+        validityPeriodHours: validHours,
+        allowedUses: [
+            "digital_signature",
+            "key_encipherment",
+            "server_auth",
+            "client_auth",
+        ]
+    });
+
+    // note this will initialize the cluster and then wait for the cluster to reach the "INITIALIZED" status which is our signal to add additional HSMs.
+    const initializedCluster = await initializeHsmCluster(cloudhsm, cluster.id, hsmSignedCert.certPem, hsmSignedCert.caPrivateKeyPem);
+
+    // below we use the initializedCluster.clusterId to force the below HSM to wait until we get to the appropriate status.
+    const hsm2 = new aws.cloudhsmv2.Hsm("hsm2", {
+        clusterId: initializedCluster?.clusterId ?? "",
+        subnetId: vpc.publicSubnetIds.apply(subs => subs[0])
+    }); 
 
     return {
-        clusterState: clusterStatus.clusterStatus,
+        clusterState: uninitializedCluster?.clusterStatus,
+        clusterCsr: uninitializedCluster?.cluster.Certificates?.apply(c => c?.ClusterCsr),
         clusterId: cluster.id,
+        hsm2Id: hsm2.id,
     }
 }
 
 interface HsmClusterStatus {
     clusterId: pulumi.Output<string>;
     clusterStatus: pulumi.Output<string>;
+    cluster: pulumi.Output<Cluster>;
 }
 
-async function initializeHsmCluster(hsm: CloudHSMV2, clusterId: pulumi.Output<string>) {
-    const clusterCsr = clusterId.apply(async id => {
-        const result = await hsm.describeClusters({
-            Filters: {
-                "clusterIds": [
-                    id,
-                ]
-            }
+// This function takes a AWS SDK CloudHSMV2 object, as well as the needed cluster items
+// it's goal is to initialize the cluster, poll the AWS API, and once the cluster reaches the INITIALIZED state, return the given data.
+async function initializeHsmCluster(
+    hsm: CloudHSMV2,
+    clusterId: pulumi.Output<string>,
+    signedCert: pulumi.Output<string>,
+    trustAnchor: pulumi.Output<string>) {
+
+    if (pulumi.runtime.isDryRun()) {
+        return;
+    }
+    
+    // using the HSM certificates as inputs, you can initialize the cluster from the AWS API
+    const state = pulumi.all([clusterId, signedCert, trustAnchor]).apply(async ([id, cert, trust]) => {
+        const initRequest = await hsm.initializeCluster({
+            ClusterId: id,
+            SignedCert: cert,
+            TrustAnchor: trust,
         });
 
-        const cluster = result.Clusters?.find(c => c.ClusterId == id);
-        return cluster!.Certificates?.ClusterCsr!;
+        return initRequest.State;
     });
 
-    const privateKey = new tls.PrivateKey("cluster-pk", {
-        algorithm: "RSA",
-        rsaBits: 2048 
-    });
-
-    const clusterCert = new tls.SelfSignedCert("cluster-selfsigned", {
-        privateKeyPem: privateKey.privateKeyPem,
-        allowedUses: [
-            "certSigning"
-        ],
-        validityPeriodHours: 24 * 365 * 10 // 10 years
-    });
-
-    
+    // once we give the initialize command, lets wait until the cluster is in our target state before returning.
+    return await getHsmClusterStatus(hsm, clusterId, ["INITIALIZED"]);
 }
 
-async function getHsmClusterStatus(hsm: CloudHSMV2, clusterId: pulumi.Output<string>, targetStatus: string, timeoutSeconds?: number): Promise<HsmClusterStatus> {
+// This function takes a AWS SDK CloudHSMV2 object, as well as the needed cluster items, plus targetStatues and timeout limit.
+// The goal is to poll the AWS API and wait until the cluster reaches the target state or the time allotment is reached.
+async function getHsmClusterStatus(hsm: CloudHSMV2, clusterId: pulumi.Output<string>, targetStatuses: string[], timeoutSeconds?: number): Promise<HsmClusterStatus | undefined> {
+    if (pulumi.runtime.isDryRun()) {
+        return;
+    }
+
     if (!timeoutSeconds) {
         timeoutSeconds = 10 * 60
     }
@@ -146,17 +164,18 @@ async function getHsmClusterStatus(hsm: CloudHSMV2, clusterId: pulumi.Output<str
             }
 
             attempts++;
-            if (cluster.State! == targetStatus) {
+            if (targetStatuses.includes(cluster.State!)) {
                 return {
                     clusterStatus: cluster.State!,
-                    clusterId: cluster.ClusterId!
+                    clusterId: cluster.ClusterId!,
+                    cluster: cluster,
                 }
             } else {
                 if (attempts > maxAttempts) {
-                    throw new Error(`Unable to obtain cluster state ${targetStatus} in the alloted timeframe`);
+                    throw new Error(`Unable to obtain desired cluster state of ${targetStatuses.join(",")} in the alloted timeframe`);
                 }
 
-                console.log(`Cluster state ${cluster.State} does not match desired state of ${targetStatus}. Will retry...`);
+                console.log(`Cluster state ${cluster.State} does not match desired state of ${targetStatuses.join(",")}. Will retry...`);
                 await sleep(10000); // 10 seconds
             }
         }
@@ -164,7 +183,8 @@ async function getHsmClusterStatus(hsm: CloudHSMV2, clusterId: pulumi.Output<str
 
     return {
         clusterId: clusterOutputs.clusterId,
-        clusterStatus: clusterOutputs.clusterStatus
+        clusterStatus: clusterOutputs.clusterStatus,
+        cluster: clusterOutputs.cluster,
     };
 }
 
